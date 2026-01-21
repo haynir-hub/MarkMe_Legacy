@@ -9,27 +9,95 @@ from enum import Enum
 
 class TrackerType(Enum):
     """Available tracker types"""
-    CSRT = "csrt"
-    KCF = "kcf"
+    CSRT = "csrt"      # Legacy - may not be available
+    KCF = "kcf"        # Legacy - may not be available
+    MIL = "mil"        # Modern - always available
+    NANO = "nano"      # Modern - lightweight DL-based
+
+
+def _create_tracker():
+    """
+    Create the best available tracker for the current OpenCV version.
+    
+    OpenCV 4.5.1+ removed CSRT/KCF from main package.
+    We try trackers in order of preference:
+    1. TrackerMIL - simple, fast, always available in modern OpenCV
+    2. TrackerCSRT (legacy) - if opencv-contrib-python is installed
+    3. TrackerKCF (legacy) - fallback
+    
+    Returns:
+        Tracker instance or None if all fail
+    """
+    tracker = None
+    tracker_name = None
+    
+    # Try TrackerMIL first (available in OpenCV 4.5.1+)
+    try:
+        tracker = cv2.TrackerMIL_create()
+        tracker_name = "TrackerMIL"
+        print(f"✅ Created {tracker_name} (modern API)")
+        return tracker, tracker_name
+    except AttributeError:
+        pass
+    
+    # Try legacy CSRT (requires opencv-contrib-python)
+    try:
+        tracker = cv2.legacy.TrackerCSRT_create()
+        tracker_name = "TrackerCSRT (legacy)"
+        print(f"✅ Created {tracker_name}")
+        return tracker, tracker_name
+    except AttributeError:
+        pass
+    
+    # Try new CSRT API
+    try:
+        tracker = cv2.TrackerCSRT_create()
+        tracker_name = "TrackerCSRT"
+        print(f"✅ Created {tracker_name}")
+        return tracker, tracker_name
+    except AttributeError:
+        pass
+    
+    # Try legacy KCF
+    try:
+        tracker = cv2.legacy.TrackerKCF_create()
+        tracker_name = "TrackerKCF (legacy)"
+        print(f"✅ Created {tracker_name}")
+        return tracker, tracker_name
+    except AttributeError:
+        pass
+    
+    # Try new KCF API
+    try:
+        tracker = cv2.TrackerKCF_create()
+        tracker_name = "TrackerKCF"
+        print(f"✅ Created {tracker_name}")
+        return tracker, tracker_name
+    except AttributeError:
+        pass
+    
+    print("❌ No compatible tracker found!")
+    return None, None
 
 
 class PlayerTracker:
     """Tracks a single player through video frames"""
     
-    def __init__(self, tracker_type: TrackerType = TrackerType.CSRT):
+    def __init__(self, tracker_type: TrackerType = TrackerType.MIL):
         """
         Initialize player tracker
         
         Args:
-            tracker_type: Type of tracker to use (CSRT or KCF)
+            tracker_type: Type of tracker to use (MIL recommended for modern OpenCV)
         """
         self.tracker_type = tracker_type
         self.tracker = None
+        self.tracker_name = None
         self.bbox = None
         self.is_initialized = False
         self.tracking_lost = False
         self.smoothing_buffer = []
-        self.buffer_size = 10  # Increased from 5 to 10 for smoother tracking
+        self.buffer_size = 10
         
     def init_tracker(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> bool:
         """
@@ -62,7 +130,6 @@ class PlayerTracker:
                 print(f"WARNING: bbox partially outside frame bounds!")
                 print(f"  Frame: {frame_w}x{frame_h}")
                 print(f"  BBox: x={x}, y={y}, w={w}, h={h}")
-                print(f"  BBox right edge: {x+w}, bottom edge: {y+h}")
                 # Clamp bbox to frame bounds
                 x = max(0, min(x, frame_w - 1))
                 y = max(0, min(y, frame_h - 1))
@@ -71,59 +138,30 @@ class PlayerTracker:
                 bbox = (x, y, w, h)
                 print(f"  Clamped to: {bbox}")
             
-            # Create tracker based on type - try legacy API first (more reliable)
-            if self.tracker_type == TrackerType.CSRT:
-                try:
-                    # Try legacy API first (more reliable in opencv-contrib-python)
-                    print("Trying cv2.legacy.TrackerCSRT_create()")
-                    self.tracker = cv2.legacy.TrackerCSRT_create()
-                    print("Successfully created TrackerCSRT (legacy API)")
-                except (AttributeError, Exception) as e:
-                    print(f"Legacy API failed: {e}")
-                    try:
-                        # Try new API
-                        print("Trying cv2.TrackerCSRT_create()")
-                        self.tracker = cv2.TrackerCSRT_create()
-                        print("Successfully created TrackerCSRT (new API)")
-                    except (AttributeError, Exception) as e2:
-                        print(f"New API also failed: {e2}")
-                        # Fallback to KCF if CSRT not available
-                        print("CSRT tracker not available, using KCF")
-                        try:
-                            self.tracker = cv2.legacy.TrackerKCF_create()
-                        except:
-                            self.tracker = cv2.TrackerKCF_create()
-            else:
-                try:
-                    self.tracker = cv2.TrackerKCF_create()
-                except AttributeError:
-                    self.tracker = cv2.legacy.TrackerKCF_create()
+            # Create tracker using helper function
+            self.tracker, self.tracker_name = _create_tracker()
             
-            # Validate tracker was created
             if self.tracker is None:
-                print("ERROR: Failed to create tracker!")
+                print("❌ ERROR: Failed to create any tracker!")
+                print("   Please ensure OpenCV is properly installed:")
+                print("   pip install opencv-python")
                 return False
             
-            print(f"Tracker created successfully, attempting init with bbox={bbox}")
+            print(f"Attempting to initialize {self.tracker_name} with bbox={bbox}")
             
             # Initialize tracker
             try:
-                success = self.tracker.init(frame, bbox)
-                print(f"tracker.init() returned: {success}")
+                result = self.tracker.init(frame, bbox)
+                print(f"tracker.init() returned: {result}")
                 
-                # If init() returned None, it might be an API issue - try creating tracker with legacy API
-                if success is None:
-                    print("⚠️ tracker.init() returned None! Trying to recreate with legacy API...")
-                    try:
-                        if self.tracker_type == TrackerType.CSRT:
-                            self.tracker = cv2.legacy.TrackerCSRT_create()
-                        else:
-                            self.tracker = cv2.legacy.TrackerKCF_create()
-                        success = self.tracker.init(frame, bbox)
-                        print(f"Legacy tracker.init() returned: {success}")
-                    except Exception as legacy_error:
-                        print(f"Legacy API also failed: {legacy_error}")
-                        return False
+                # In OpenCV 4.5.1+, init() returns None but still works!
+                # We consider initialization successful if:
+                # 1. init() returns True (older API)
+                # 2. init() returns None (newer API - tracker is still initialized)
+                # Only fail if init() explicitly returns False
+                if result is False:
+                    print(f"❌ tracker.init() explicitly returned False!")
+                    return False
                 
             except Exception as init_error:
                 print(f"ERROR during tracker.init(): {init_error}")
@@ -131,17 +169,14 @@ class PlayerTracker:
                 traceback.print_exc()
                 return False
             
-            # Check if initialization was successful
-            if success:
-                self.bbox = bbox
-                self.is_initialized = True
-                self.tracking_lost = False
-                self.smoothing_buffer = [bbox]
-                print(f"✅ Tracker initialized successfully!")
-                return True
-            else:
-                print(f"❌ tracker.init() returned False or None!")
-                return False
+            # Success - tracker is initialized
+            self.bbox = bbox
+            self.is_initialized = True
+            self.tracking_lost = False
+            self.smoothing_buffer = [bbox]
+            print(f"✅ Tracker initialized successfully with {self.tracker_name}!")
+            return True
+                
         except Exception as e:
             print(f"❌ Exception in init_tracker: {e}")
             import traceback

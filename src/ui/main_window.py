@@ -23,6 +23,72 @@ from ..render.batch_exporter import BatchExportThread
 from .video_canvas import VideoCanvas
 from .player_selector import PlayerSelector
 from .preview_dialog import PreviewDialog
+
+
+class LTRSlider(QSlider):
+    """A slider that always behaves as LTR regardless of system locale"""
+    def __init__(self, orientation=Qt.Orientation.Horizontal, parent=None):
+        super().__init__(orientation, parent)
+        # Force the visual appearance to be LTR
+        self.setInvertedAppearance(True)
+        self.setInvertedControls(True)
+
+    def mousePressEvent(self, event):
+        """Handle mouse press - calculate value based on click position (LTR: left=min, right=max)"""
+        if self.orientation() == Qt.Orientation.Horizontal:
+            # Click position from left edge
+            click_ratio = event.position().x() / self.width()
+            value = self.minimum() + (self.maximum() - self.minimum()) * click_ratio
+            self.setValue(int(value))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """Handle mouse drag"""
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            if self.orientation() == Qt.Orientation.Horizontal:
+                click_ratio = event.position().x() / self.width()
+                value = self.minimum() + (self.maximum() - self.minimum()) * click_ratio
+                value = max(self.minimum(), min(self.maximum(), int(value)))
+                self.setValue(value)
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+
+class PlayerListItemWidget(QWidget):
+    """Custom widget for player list items"""
+
+    def __init__(self, player_id: int, name: str, style: str, learning_count: int = 1, parent=None):
+        super().__init__(parent)
+        self.player_id = player_id
+
+        layout = QHBoxLayout()
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(8)
+
+        # Style icon
+        icons = {
+            'dynamic_ring_3d': '🟣',
+            'spotlight_alien': '👽',
+            'solid_anchor': '⚓',
+            'radar_defensive': '📡',
+            'sniper_scope': '🎯'
+        }
+        icon = icons.get(style, '👤')
+
+        # Player name label
+        if learning_count > 1:
+            label_text = f"{icon} {name} ({learning_count} frames)"
+        else:
+            label_text = f"{icon} {name}"
+
+        self.name_label = QLabel(label_text)
+        self.name_label.setStyleSheet("color: #ffffff; font-weight: 500;")
+        layout.addWidget(self.name_label, stretch=1)
+
+        self.setLayout(layout)
 from .batch_preview_dialog import BatchPreviewDialog
 
 
@@ -36,13 +102,14 @@ class CollapsibleSection(QWidget):
         self.toggle_btn.setCheckable(True)
         self.toggle_btn.setChecked(default_open)
         self.toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle_btn.setFixedHeight(28)  # Compact button height
         self._title = title
         self._update_title()
         self.toggle_btn.clicked.connect(self._on_toggled)
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 4)
+        layout.setSpacing(4)  # Reduced spacing
         layout.addWidget(self.toggle_btn)
         layout.addWidget(self.content)
         self.setLayout(layout)
@@ -435,12 +502,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Video Markme - Batch Player Tracking")
-        self.setMinimumSize(1400, 900)
+        self.setMinimumSize(1200, 700)
         
         # State - NEW: Using ProjectManager for multiple videos
         self.project_manager = ProjectManager()
         self.current_frame_idx = 0
         self._waiting_for_bbox = False
+        self._selected_player_id = None  # For bbox highlighting when navigating
+        self._prev_frame_idx = 0  # For live tracking preview
+        self._preview_tracking_cache = {}  # {player_id: {frame_idx: bbox}} for live preview
         
         # Threads
         self.tracking_thread = None
@@ -662,10 +732,11 @@ class MainWindow(QMainWindow):
         # Videos List (collapsed by default)
         videos_content = QWidget()
         videos_layout = QVBoxLayout()
-        videos_layout.setSpacing(8)
-        videos_layout.setContentsMargins(6, 6, 6, 6)
+        videos_layout.setSpacing(4)
+        videos_layout.setContentsMargins(4, 4, 4, 4)
         
         self.videos_list = QListWidget()
+        self.videos_list.setMaximumHeight(80)  # Limit height to prevent overflow
         self.videos_list.itemClicked.connect(self._on_video_selected)
         videos_layout.addWidget(self.videos_list)
         
@@ -695,11 +766,13 @@ class MainWindow(QMainWindow):
         # Players for current video (open)
         players_content = QWidget()
         players_layout = QVBoxLayout()
-        players_layout.setSpacing(8)
-        players_layout.setContentsMargins(6, 6, 6, 6)
+        players_layout.setSpacing(4)
+        players_layout.setContentsMargins(4, 4, 4, 4)
         
         self.players_list = QListWidget()
+        self.players_list.setMaximumHeight(120)  # Limit height to prevent overflow
         self.players_list.itemClicked.connect(self._on_player_selected)
+        self.players_list.itemDoubleClicked.connect(self._edit_player_style)  # Double-click to edit
         players_layout.addWidget(self.players_list)
         
         player_buttons_layout = QHBoxLayout()
@@ -710,13 +783,50 @@ class MainWindow(QMainWindow):
         self.add_player_btn.setEnabled(False)
         player_buttons_layout.addWidget(self.add_player_btn)
         
+        self.edit_style_btn = QPushButton("✏️ Edit Style")
+        self.edit_style_btn.setObjectName("sidebarAction")
+        self.edit_style_btn.clicked.connect(self._edit_player_style)
+        self.edit_style_btn.setEnabled(False)
+        self.edit_style_btn.setToolTip("Change marker style for selected player (or double-click)")
+        player_buttons_layout.addWidget(self.edit_style_btn)
+        
         self.remove_player_btn = QPushButton("➖ Remove")
         self.remove_player_btn.setObjectName("sidebarAction")
         self.remove_player_btn.clicked.connect(self._remove_player)
         self.remove_player_btn.setEnabled(False)
         player_buttons_layout.addWidget(self.remove_player_btn)
-        
+
+        # Radar keyframe button (only for radar_defensive markers)
+        self.set_radar_btn = QPushButton("📡 Set Radar")
+        self.set_radar_btn.setObjectName("sidebarAction")
+        self.set_radar_btn.clicked.connect(self._set_radar_direction)
+        self.set_radar_btn.setEnabled(False)
+        self.set_radar_btn.setToolTip("Click on video to set radar direction for current frame")
+        player_buttons_layout.addWidget(self.set_radar_btn)
+
         players_layout.addLayout(player_buttons_layout)
+        
+        # Second row of player buttons
+        player_buttons_layout2 = QHBoxLayout()
+        player_buttons_layout2.setSpacing(4)
+        
+        # Radar color toggle button (only for radar_defensive markers)
+        self.radar_color_btn = QPushButton("🟢 Radar: Green")
+        self.radar_color_btn.setObjectName("sidebarAction")
+        self.radar_color_btn.clicked.connect(self._toggle_radar_color)
+        self.radar_color_btn.setEnabled(False)
+        self.radar_color_btn.setToolTip("Toggle radar color between green (correct) and red (incorrect) from this frame")
+        player_buttons_layout2.addWidget(self.radar_color_btn)
+        
+        # Player time range button
+        self.player_range_btn = QPushButton("⏱️ Set Range")
+        self.player_range_btn.setObjectName("sidebarAction")
+        self.player_range_btn.clicked.connect(self._set_player_time_range)
+        self.player_range_btn.setEnabled(False)
+        self.player_range_btn.setToolTip("Set start and end frames for this player's tracking")
+        player_buttons_layout2.addWidget(self.player_range_btn)
+        
+        players_layout.addLayout(player_buttons_layout2)
         players_layout.addStretch()
         players_content.setLayout(players_layout)
         layout.addWidget(CollapsibleSection("👥 Players (Current Video)", players_content, default_open=True))
@@ -724,8 +834,8 @@ class MainWindow(QMainWindow):
         # Tracking Section (open)
         tracking_content = QWidget()
         tracking_layout = QVBoxLayout()
-        tracking_layout.setSpacing(8)
-        tracking_layout.setContentsMargins(6, 6, 6, 6)
+        tracking_layout.setSpacing(4)
+        tracking_layout.setContentsMargins(4, 4, 4, 4)
         
         self.track_all_btn = QPushButton("▶ Start Tracking All Videos")
         self.track_all_btn.setObjectName("startTrackingBtn")
@@ -739,8 +849,8 @@ class MainWindow(QMainWindow):
         # Tracking Range Section (open)
         tracking_range_content = QWidget()
         tracking_range_layout = QVBoxLayout()
-        tracking_range_layout.setSpacing(8)
-        tracking_range_layout.setContentsMargins(6, 6, 6, 6)
+        tracking_range_layout.setSpacing(4)
+        tracking_range_layout.setContentsMargins(4, 4, 4, 4)
         
         tracking_range_info_layout = QHBoxLayout()
         self.tracking_range_info_label = QLabel("Tracking: Full video")
@@ -776,13 +886,13 @@ class MainWindow(QMainWindow):
         tracking_range_layout.addLayout(clear_buttons_layout)
         
         tracking_range_content.setLayout(tracking_range_layout)
-        layout.addWidget(CollapsibleSection("🎯 Tracking Range", tracking_range_content, default_open=True))
+        layout.addWidget(CollapsibleSection("🎯 Tracking Range", tracking_range_content, default_open=False))
         
         # Batch Export (collapsed by default)
         export_content = QWidget()
         export_layout = QVBoxLayout()
-        export_layout.setSpacing(8)
-        export_layout.setContentsMargins(6, 6, 6, 6)
+        export_layout.setSpacing(4)
+        export_layout.setContentsMargins(4, 4, 4, 4)
         
         self.export_all_btn = QPushButton("📤 Export All Videos")
         self.export_all_btn.setObjectName("exportBtn")
@@ -827,6 +937,9 @@ class MainWindow(QMainWindow):
         self.video_canvas = VideoCanvas()
         self.video_canvas.bbox_selected.connect(self._on_bbox_selected)
         self.video_canvas.person_clicked.connect(self._on_person_clicked)
+        self.video_canvas.zoom_changed.connect(self._on_zoom_changed)
+        self.video_canvas.zoom_detection_requested.connect(self._on_zoom_detection_requested)
+        self.video_canvas.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # Enable keyboard focus for zoom
         layout.addWidget(self.video_canvas)
         
         # Frame controls - IMPROVED with slider and jump buttons
@@ -834,7 +947,7 @@ class MainWindow(QMainWindow):
         
         # Top row: Slider for fast navigation
         slider_row = QHBoxLayout()
-        self.frame_slider = QSlider(Qt.Orientation.Horizontal)
+        self.frame_slider = LTRSlider(Qt.Orientation.Horizontal)
         self.frame_slider.setMinimum(0)
         self.frame_slider.setMaximum(0)
         self.frame_slider.setValue(0)
@@ -1072,6 +1185,10 @@ class MainWindow(QMainWindow):
         if not project:
             return
         
+        # Clear player selection and preview cache when switching videos
+        self._selected_player_id = None
+        self._preview_tracking_cache = {}
+        
         # Display video info
         self.video_info_label.setText(project.get_info_text())
         
@@ -1110,19 +1227,30 @@ class MainWindow(QMainWindow):
     def _update_players_list(self):
         """Update players list for current project"""
         self.players_list.clear()
-        
+
         project = self.project_manager.get_current_project()
         if not project:
             return
-        
+
         for player in project.get_players():
             learning_count = len(player.learning_frames)
-            if learning_count > 1:
-                item = QListWidgetItem(f"{player.name} ({player.marker_style}) - {learning_count} learning frames")
-            else:
-                item = QListWidgetItem(f"{player.name} ({player.marker_style})")
+
+            # Create list item
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, player.player_id)
+
+            # Create custom widget
+            widget = PlayerListItemWidget(
+                player.player_id,
+                player.name,
+                player.marker_style,
+                learning_count
+            )
+
+            # Set item size hint and add to list
+            item.setSizeHint(widget.sizeHint())
             self.players_list.addItem(item)
+            self.players_list.setItemWidget(item, widget)
     
     def _update_buttons(self):
         """Update button states based on current project"""
@@ -1134,8 +1262,34 @@ class MainWindow(QMainWindow):
         
         self.remove_video_btn.setEnabled(has_current)
         self.add_player_btn.setEnabled(has_current)
-        self.remove_player_btn.setEnabled(has_players)
         
+        # Player edit/remove buttons: enabled if a player is selected
+        has_selected_player = self.players_list.currentItem() is not None
+        self.remove_player_btn.setEnabled(has_players and has_selected_player)
+        self.edit_style_btn.setEnabled(has_players and has_selected_player)
+
+        # Radar button: enabled if selected player has radar_defensive marker
+        radar_btn_enabled = False
+        selected_player = None
+        if has_selected_player and current_project:
+            player_id = self.players_list.currentItem().data(Qt.ItemDataRole.UserRole)
+            selected_player = current_project.tracker_manager.get_player(player_id)
+            if selected_player and selected_player.marker_style == 'radar_defensive':
+                radar_btn_enabled = True
+        self.set_radar_btn.setEnabled(radar_btn_enabled)
+        self.radar_color_btn.setEnabled(radar_btn_enabled)
+        
+        # Update radar color button text based on current frame's color
+        if radar_btn_enabled and selected_player:
+            current_color = selected_player.get_radar_color_at_frame(self.current_frame_idx)
+            if current_color == (0, 255, 100):  # Green
+                self.radar_color_btn.setText("🟢 Radar: Green")
+            else:  # Red
+                self.radar_color_btn.setText("🔴 Radar: Red")
+        
+        # Player range button: enabled for any selected player
+        self.player_range_btn.setEnabled(has_selected_player)
+
         # Export single button: enabled only if has players and status is MARKED
         can_export_single = has_players and current_project and current_project.status == ProjectStatus.MARKED
         self.export_single_btn.setEnabled(can_export_single)
@@ -1885,6 +2039,23 @@ class MainWindow(QMainWindow):
         self.prev_frame_btn.setEnabled(self.current_frame_idx > 0)
         self.next_frame_btn.setEnabled(self.tracker_manager.total_frames > 1)
         self._update_frame_navigation_buttons()
+        
+        # Show zoom tip
+        try:
+            self.statusBar().showMessage(
+                f"✅ Video loaded. Tip: {self._get_zoom_shortcut_hint()} to zoom in for better detection.", 
+                5000
+            )
+        except Exception:
+            pass
+    
+    def _get_zoom_shortcut_hint(self) -> str:
+        """Get platform-specific zoom shortcut hint"""
+        import sys
+        if sys.platform == 'darwin':
+            return "⌘+Scroll"
+        else:
+            return "Ctrl+Scroll"
     
     def _add_player_marker(self):
         """Add a new player marker using automatic person detection"""
@@ -1997,6 +2168,61 @@ class MainWindow(QMainWindow):
         # Use the padded bbox for tracking, but pass original bbox for accurate marker placement
         self._on_bbox_selected(x_padded, y_padded, w_padded, h_padded, original_bbox=(x, y, w, h))
     
+    def _on_zoom_changed(self, zoom_level: float, visible_region: tuple):
+        """Handle zoom level changes"""
+        if zoom_level > 1.0:
+            try:
+                self.statusBar().showMessage(
+                    f"🔍 Zoom: {zoom_level:.0%} | Shift+Drag to pan | Double-click or Esc to reset", 
+                    3000
+                )
+            except Exception:
+                pass
+    
+    def _on_zoom_detection_requested(self, cropped_frame, original_region: tuple):
+        """
+        Handle detection request on zoomed region.
+        This enables finding players that were too small at original resolution.
+        """
+        if cropped_frame is None or cropped_frame.size == 0:
+            return
+        
+        x_offset, y_offset, region_w, region_h = original_region
+        
+        # Initialize detector if needed
+        if not hasattr(self, 'person_detector'):
+            self.person_detector = PersonDetector()
+        
+        if not self.person_detector.is_available():
+            return
+        
+        # Run detection on zoomed region with lower threshold to catch smaller objects
+        # Lower threshold than full-frame since zoom should help detect harder cases
+        detections = self.person_detector.detect_people(cropped_frame, confidence_threshold=0.2)
+        
+        if not detections:
+            return
+        
+        # Convert detections back to original frame coordinates
+        adjusted_detections = []
+        for det_x, det_y, det_w, det_h, conf in detections:
+            # Add offset to map back to original frame
+            orig_x = det_x + x_offset
+            orig_y = det_y + y_offset
+            adjusted_detections.append((orig_x, orig_y, det_w, det_h, conf))
+        
+        # Update video canvas with detections (they'll be shown relative to the full frame)
+        self.video_canvas.set_detected_people(adjusted_detections)
+        self.video_canvas.enable_detection_mode(True)
+        
+        try:
+            self.statusBar().showMessage(
+                f"🔍 Zoom Detection: Found {len(adjusted_detections)} person(s). Click to select.", 
+                4000
+            )
+        except Exception:
+            pass
+    
     def _on_bbox_selected(self, x: int, y: int, w: int, h: int,
                          original_bbox: Optional[Tuple[int, int, int, int]] = None):
         """Handle bounding box selection (manual or from detection)"""
@@ -2073,19 +2299,23 @@ class MainWindow(QMainWindow):
                         (x, y, w, h)
                     )
                     
+                    # CRITICAL: Clear preview cache from this frame onwards
+                    # This ensures fresh tracking will happen from the learning frame
+                    player_id = selected_player.player_id
+                    if player_id in self._preview_tracking_cache:
+                        frames_to_remove = [f for f in self._preview_tracking_cache[player_id] 
+                                           if f >= self.current_frame_idx]
+                        for f in frames_to_remove:
+                            del self._preview_tracking_cache[player_id][f]
+                        print(f"🧹 Cleared preview cache from frame {self.current_frame_idx} onwards for player {player_id}")
+                    
                     # Update canvas to show learning frame
                     color_map = {
-                        'arrow': (0, 255, 255),  # Yellow
-                        'circle': (0, 255, 255),  # Yellow
-                        'rectangle': (255, 100, 0),  # Blue
-                        'spotlight': (100, 255, 255),  # Cyan
-                        'neon_ring': (255, 255, 255),  # White
-                        'pulse': (0, 165, 255),  # Orange (BGR)
-                        'gradient': (255, 0, 200),  # Purple
-                        'dynamic_arrow': (0, 255, 200),  # Cyan
-                        'hexagon': (255, 150, 0),  # Orange
-                        'crosshair': (0, 255, 0),  # Green
-                        'flame': (0, 100, 255)  # Orange/Red
+                        'dynamic_ring_3d': (255, 0, 180),  # Purple
+                        'spotlight_alien': (200, 255, 255),  # Cyan
+                        'solid_anchor': (0, 255, 100),  # Green
+                        'radar_defensive': (0, 50, 255),  # Red-Orange
+                        'sniper_scope': (0, 0, 255),  # Red
                     }
                     color = color_map.get(selected_player.marker_style, (255, 255, 255))
                     self.video_canvas.add_bbox(x, y, w, h, f"{selected_player.name} (Learning)", selected_player.marker_style, color)
@@ -2109,8 +2339,13 @@ class MainWindow(QMainWindow):
                     return
             
             # New player or user said "No" - create new player
-            # Show selector dialog
-            selector = PlayerSelector(self)
+            # Get current frame for preview
+            current_frame = project.tracker_manager.get_frame(self.current_frame_idx)
+            
+            # Show selector dialog with live preview
+            # Use ORIGINAL bbox (if available) for preview so marker appears at correct feet position
+            preview_bbox = original_bbox if original_bbox else (x, y, w, h)
+            selector = PlayerSelector(self, frame=current_frame, bbox=preview_bbox)
             
             def on_confirmed(name: str, style: str):
                 try:
@@ -2121,17 +2356,11 @@ class MainWindow(QMainWindow):
                     
                     # Get color for style
                     color_map = {
-                        'arrow': (0, 255, 255),  # Yellow
-                        'circle': (0, 255, 255),  # Yellow
-                        'rectangle': (255, 100, 0),  # Blue
-                        'spotlight': (100, 255, 255),  # Cyan
-                        'neon_ring': (255, 255, 255),  # White
-                        'pulse': (0, 165, 255),  # Orange (BGR)
-                        'gradient': (255, 0, 200),  # Purple
-                        'dynamic_arrow': (0, 255, 200),  # Cyan
-                        'hexagon': (255, 150, 0),  # Orange
-                        'crosshair': (0, 255, 0),  # Green
-                        'flame': (0, 100, 255)  # Orange/Red
+                        'dynamic_ring_3d': (255, 0, 180),  # Purple
+                        'spotlight_alien': (200, 255, 255),  # Cyan
+                        'solid_anchor': (0, 255, 100),  # Green
+                        'radar_defensive': (0, 50, 255),  # Red-Orange
+                        'sniper_scope': (0, 0, 255),  # Red
                     }
                     color = color_map.get(style, (255, 255, 255))
                     
@@ -2175,7 +2404,118 @@ class MainWindow(QMainWindow):
     
     def _on_player_selected(self, item: QListWidgetItem):
         """Handle player selection in list"""
+        print(f"_on_player_selected called")
         self.remove_player_btn.setEnabled(True)
+        self.edit_style_btn.setEnabled(True)
+
+        # Update radar button based on selected player's marker style
+        project = self.project_manager.get_current_project()
+        if project and item:
+            player_id = item.data(Qt.ItemDataRole.UserRole)
+            self._selected_player_id = player_id  # Store for bbox highlighting
+            player = project.tracker_manager.get_player(player_id)
+            if player:
+                is_radar = player.marker_style == 'radar_defensive'
+                print(f"  Player '{player.name}' style: {player.marker_style}, enabling radar btn: {is_radar}")
+                # Enable radar button only for radar_defensive style
+                self.set_radar_btn.setEnabled(is_radar)
+                self.radar_color_btn.setEnabled(is_radar)
+                
+                # Update radar color button text
+                if is_radar:
+                    current_color = player.get_radar_color_at_frame(self.current_frame_idx)
+                    if current_color == (0, 255, 100):  # Green
+                        self.radar_color_btn.setText("🟢 Radar: Green")
+                    else:
+                        self.radar_color_btn.setText("🔴 Radar: Red")
+                
+                # Enable player range button for any selected player
+                self.player_range_btn.setEnabled(True)
+                
+                # Refresh frame to show bbox highlight for selected player
+                self._show_frame(self.current_frame_idx)
+            else:
+                self.set_radar_btn.setEnabled(False)
+                self.radar_color_btn.setEnabled(False)
+                self.player_range_btn.setEnabled(False)
+        else:
+            self._selected_player_id = None
+            self.set_radar_btn.setEnabled(False)
+            self.radar_color_btn.setEnabled(False)
+            self.player_range_btn.setEnabled(False)
+    
+    def _edit_player_style(self, item: QListWidgetItem = None):
+        """Edit marker style for selected player"""
+        # Get selected item if not provided
+        if item is None:
+            item = self.players_list.currentItem()
+        
+        if not item:
+            return
+        
+        project = self.project_manager.get_current_project()
+        if not project:
+            return
+        
+        player_id = item.data(Qt.ItemDataRole.UserRole)
+        player = project.tracker_manager.get_player(player_id)
+        
+        if not player:
+            return
+        
+        # Get player's ORIGINAL bbox for preview (not padded) for correct marker positioning
+        bbox = player.current_original_bbox or player.original_bbox
+        if not bbox:
+            # Try to get from original_learning_frames first
+            if player.original_learning_frames:
+                first_frame_idx = min(player.original_learning_frames.keys())
+                bbox = player.original_learning_frames[first_frame_idx]
+            elif player.learning_frames:
+                first_frame_idx = min(player.learning_frames.keys())
+                bbox = player.learning_frames[first_frame_idx]
+        
+        if not bbox:
+            QMessageBox.warning(self, "Error", "Cannot find player bounding box for preview")
+            return
+        
+        # Get current frame for preview
+        current_frame = project.tracker_manager.get_frame(self.current_frame_idx)
+        
+        # Show selector dialog with current values
+        selector = PlayerSelector(
+            self, 
+            frame=current_frame, 
+            bbox=bbox,
+            existing_name=player.name,
+            existing_style=player.marker_style
+        )
+        
+        def on_confirmed(new_name: str, new_style: str):
+            # Update player
+            player.name = new_name
+            player.marker_style = new_style
+            
+            # Update color based on new style
+            color_map = {
+                'dynamic_ring_3d': (255, 0, 180),  # Purple
+                'spotlight_alien': (200, 255, 255),  # Cyan
+                'solid_anchor': (0, 255, 100),  # Green
+                'radar_defensive': (0, 50, 255),  # Red-Orange
+                'sniper_scope': (0, 0, 255),  # Red
+            }
+            player.color = color_map.get(new_style, (255, 255, 255))
+            
+            # Update UI
+            self._update_players_list()
+            
+            # Refresh frame to show new marker style
+            self._show_frame(self.current_frame_idx)
+            
+            self.status_label.setText(f"✅ Updated {new_name} to {new_style}")
+            self.status_label.setStyleSheet("color: green;")
+        
+        selector.player_confirmed.connect(on_confirmed)
+        selector.exec()
     
     def _remove_player(self):
         """Remove selected player"""
@@ -2189,6 +2529,10 @@ class MainWindow(QMainWindow):
             return
         
         player_id = current_item.data(Qt.ItemDataRole.UserRole)
+        
+        # Clear selection if this player was selected
+        if hasattr(self, '_selected_player_id') and self._selected_player_id == player_id:
+            self._selected_player_id = None
         
         # Remove from tracker
         project.tracker_manager.remove_player(player_id)
@@ -2207,15 +2551,254 @@ class MainWindow(QMainWindow):
         
         # Refresh display
         self._show_frame(self.current_frame_idx)
-        
+
         # Update all buttons
         self._update_buttons()
-    
+
+    def _set_radar_direction(self):
+        """Enter radar direction setting mode - click on video to set direction"""
+        print("📡 _set_radar_direction called!")
+
+        current_item = self.players_list.currentItem()
+        if not current_item:
+            print("  No player selected")
+            QMessageBox.warning(self, "No Player Selected", "Please select a player first.")
+            return
+
+        project = self.project_manager.get_current_project()
+        if not project:
+            print("  No project")
+            return
+
+        player_id = current_item.data(Qt.ItemDataRole.UserRole)
+        player = project.tracker_manager.get_player(player_id)
+        print(f"  Player: {player.name if player else 'None'}, style: {player.marker_style if player else 'N/A'}")
+
+        if not player:
+            return
+
+        if player.marker_style != 'radar_defensive':
+            QMessageBox.information(
+                self, "Not a Radar Marker",
+                "Radar direction can only be set for players with Radar Defensive marker style."
+            )
+            return
+
+        # Get player's current bbox for preview
+        # IMPORTANT: Use ORIGINAL bbox (not padded) for correct feet position
+        bbox = player.current_original_bbox or player.original_bbox or player.current_bbox or player.bbox
+        if not bbox:
+            QMessageBox.warning(self, "No Position", "Player has no position on current frame.")
+            return
+        
+        print(f"  Using bbox for radar: {bbox} (original_bbox={player.original_bbox}, current_original_bbox={player.current_original_bbox})")
+
+        # Store the player we're setting radar for
+        self._radar_setting_player_id = player_id
+
+        # Update status
+        self.status_label.setText(f"Move mouse to set radar direction for '{player.name}' | Click to confirm | ESC to cancel")
+        self.status_label.setStyleSheet("color: orange;")
+
+        print(f"  Entering radar edit mode with bbox: {bbox}")
+
+        # Enter radar edit mode on video canvas
+        self.video_canvas.enter_radar_edit_mode(bbox)
+
+        # Connect to radar direction set signal
+        self.video_canvas.radar_direction_set.connect(self._on_radar_direction_set)
+        print("  Radar edit mode activated!")
+
+    def _on_radar_direction_set(self, angle: float):
+        """Handle radar direction being set from video canvas"""
+        # Get size from video canvas before disconnecting
+        size = getattr(self.video_canvas, 'radar_preview_size', 1.0)
+
+        # Disconnect signal
+        try:
+            self.video_canvas.radar_direction_set.disconnect(self._on_radar_direction_set)
+        except TypeError:
+            pass
+
+        if not hasattr(self, '_radar_setting_player_id'):
+            return
+
+        player_id = self._radar_setting_player_id
+        del self._radar_setting_player_id
+
+        project = self.project_manager.get_current_project()
+        if not project:
+            return
+
+        player = project.tracker_manager.get_player(player_id)
+        if not player:
+            return
+
+        # Add radar keyframe for current frame with size
+        player.add_radar_keyframe(self.current_frame_idx, angle, size=size)
+
+        keyframe_count = len(player.radar_keyframes)
+        self.status_label.setText(
+            f"Radar direction set for '{player.name}' at frame {self.current_frame_idx} "
+            f"({keyframe_count} keyframe{'s' if keyframe_count > 1 else ''})"
+        )
+        self.status_label.setStyleSheet("color: green;")
+
+        # Refresh display to show new radar direction
+        self._show_frame(self.current_frame_idx)
+
+    def _toggle_radar_color(self):
+        """Toggle radar color between green and red from current frame"""
+        project = self.project_manager.get_current_project()
+        if not project:
+            return
+        
+        item = self.players_list.currentItem()
+        if not item:
+            return
+        
+        player_id = item.data(Qt.ItemDataRole.UserRole)
+        player = project.tracker_manager.get_player(player_id)
+        if not player or player.marker_style != 'radar_defensive':
+            return
+        
+        # Get current color and toggle
+        current_color = player.get_radar_color_at_frame(self.current_frame_idx)
+        if current_color == (0, 255, 100):  # Currently green
+            new_color = 'red'
+            self.radar_color_btn.setText("🔴 Radar: Red")
+        else:  # Currently red
+            new_color = 'green'
+            self.radar_color_btn.setText("🟢 Radar: Green")
+        
+        # Set color keyframe for current frame
+        player.set_radar_color_at_frame(self.current_frame_idx, new_color)
+        
+        # Show status
+        self.status_label.setText(
+            f"Radar color set to {new_color} from frame {self.current_frame_idx} for '{player.name}'"
+        )
+        self.status_label.setStyleSheet(f"color: {'green' if new_color == 'green' else 'red'};")
+        
+        # Refresh display
+        self._show_frame(self.current_frame_idx)
+
+    def _set_player_time_range(self):
+        """Set custom start and end frames for selected player"""
+        project = self.project_manager.get_current_project()
+        if not project:
+            return
+        
+        item = self.players_list.currentItem()
+        if not item:
+            return
+        
+        player_id = item.data(Qt.ItemDataRole.UserRole)
+        player = project.tracker_manager.get_player(player_id)
+        if not player:
+            return
+        
+        total_frames = project.tracker_manager.total_frames
+        fps = project.tracker_manager.fps
+        
+        # Get current range (or defaults)
+        current_start, current_end = player.get_tracking_range()
+        if current_start is None:
+            current_start = 0
+        if current_end is None:
+            current_end = total_frames - 1
+        
+        # Create dialog
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QDialogButtonBox, QPushButton
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Set Time Range for {player.name}")
+        dialog.setMinimumWidth(400)
+        layout = QVBoxLayout(dialog)
+        
+        # Info label
+        info_label = QLabel(f"Total frames: {total_frames} ({total_frames/fps:.1f} seconds)")
+        layout.addWidget(info_label)
+        
+        # Start frame
+        start_layout = QHBoxLayout()
+        start_layout.addWidget(QLabel("Start Frame:"))
+        start_spin = QSpinBox()
+        start_spin.setRange(0, total_frames - 1)
+        start_spin.setValue(current_start)
+        start_layout.addWidget(start_spin)
+        start_time_label = QLabel(f"({current_start/fps:.2f}s)")
+        start_layout.addWidget(start_time_label)
+        use_current_start_btn = QPushButton("Use Current")
+        use_current_start_btn.clicked.connect(lambda: start_spin.setValue(self.current_frame_idx))
+        start_layout.addWidget(use_current_start_btn)
+        layout.addLayout(start_layout)
+        
+        # End frame
+        end_layout = QHBoxLayout()
+        end_layout.addWidget(QLabel("End Frame:"))
+        end_spin = QSpinBox()
+        end_spin.setRange(0, total_frames - 1)
+        end_spin.setValue(current_end)
+        end_layout.addWidget(end_spin)
+        end_time_label = QLabel(f"({current_end/fps:.2f}s)")
+        end_layout.addWidget(end_time_label)
+        use_current_end_btn = QPushButton("Use Current")
+        use_current_end_btn.clicked.connect(lambda: end_spin.setValue(self.current_frame_idx))
+        end_layout.addWidget(use_current_end_btn)
+        layout.addLayout(end_layout)
+        
+        # Update time labels when values change
+        def update_time_labels():
+            start_time_label.setText(f"({start_spin.value()/fps:.2f}s)")
+            end_time_label.setText(f"({end_spin.value()/fps:.2f}s)")
+        start_spin.valueChanged.connect(update_time_labels)
+        end_spin.valueChanged.connect(update_time_labels)
+        
+        # Clear range button
+        clear_btn = QPushButton("Clear Custom Range (Use Global)")
+        def clear_range():
+            player.set_tracking_range(None, None)
+            dialog.accept()
+            self.status_label.setText(f"Cleared custom range for '{player.name}' - using global range")
+            self.status_label.setStyleSheet("color: orange;")
+            self._show_frame(self.current_frame_idx)
+        clear_btn.clicked.connect(clear_range)
+        layout.addWidget(clear_btn)
+        
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            start_val = start_spin.value()
+            end_val = end_spin.value()
+            
+            # Validate
+            if start_val > end_val:
+                QMessageBox.warning(self, "Invalid Range", "Start frame must be before end frame!")
+                return
+            
+            # Set range
+            player.set_tracking_range(start_val, end_val)
+            
+            self.status_label.setText(
+                f"Set range for '{player.name}': frames {start_val}-{end_val} "
+                f"({start_val/fps:.1f}s - {end_val/fps:.1f}s)"
+            )
+            self.status_label.setStyleSheet("color: green;")
+            
+            # Refresh display
+            self._show_frame(self.current_frame_idx)
+
     def _prev_frame(self):
         """Go to previous frame"""
         try:
             project = self.project_manager.get_current_project()
             if project and self.current_frame_idx > 0:
+                self._prev_frame_idx = self.current_frame_idx  # Store for live tracking
                 self.current_frame_idx -= 1
                 self._show_frame(self.current_frame_idx)
                 # Stop auto-preview if manually navigating
@@ -2234,6 +2817,7 @@ class MainWindow(QMainWindow):
             project = self.project_manager.get_current_project()
             if project and project.tracker_manager.total_frames > 0:
                 if self.current_frame_idx < project.tracker_manager.total_frames - 1:
+                    self._prev_frame_idx = self.current_frame_idx  # Store for live tracking
                     self.current_frame_idx += 1
                     self._show_frame(self.current_frame_idx)
                 # Stop auto-preview if manually navigating
@@ -2352,9 +2936,10 @@ class MainWindow(QMainWindow):
                 button_bar.setVisible(False)
                 return
             
-            # Show selector dialog (in fullscreen window context)
+            # Show selector dialog (in fullscreen window context) with preview
             from .player_selector import PlayerSelector
-            selector = PlayerSelector(fullscreen_window)
+            current_frame = project.tracker_manager.get_frame(self.current_frame_idx)
+            selector = PlayerSelector(fullscreen_window, frame=current_frame, bbox=(x, y, w, h))
             
             def on_confirmed(name: str, style: str):
                 # Add player to project (manual bbox selection, no padding)
@@ -2364,17 +2949,11 @@ class MainWindow(QMainWindow):
                 
                 # Get color for style
                 color_map = {
-                    'arrow': (0, 255, 255),  # Yellow
-                    'circle': (0, 255, 255),  # Yellow
-                    'rectangle': (255, 100, 0),  # Blue
-                    'spotlight': (100, 255, 255),  # Cyan
-                    'neon_ring': (255, 255, 255),  # White
-                    'pulse': (0, 200, 255),  # Orange
-                    'gradient': (255, 0, 200),  # Purple
-                    'dynamic_arrow': (0, 255, 200),  # Cyan
-                    'hexagon': (255, 150, 0),  # Orange
-                    'crosshair': (0, 255, 0),  # Green
-                    'flame': (0, 100, 255)  # Orange/Red
+                    'dynamic_ring_3d': (255, 0, 180),  # Purple
+                    'spotlight_alien': (200, 255, 255),  # Cyan
+                    'solid_anchor': (0, 255, 100),  # Green
+                    'radar_defensive': (0, 50, 255),  # Red-Orange
+                    'sniper_scope': (0, 0, 255),  # Red
                 }
                 color = color_map.get(style, (255, 255, 255))
                 
@@ -2581,12 +3160,16 @@ class MainWindow(QMainWindow):
                 renderer = OverlayRenderer()
                 players = tracker_manager.get_all_players()
 
-                # Debug: print status
+                # Check if FULL tracking was done (not just marking)
+                # Use project status instead of checking tracking_results (which has initial bbox from marking)
+                from ..tracking.video_project import ProjectStatus
+                has_tracking_results = project.status == ProjectStatus.TRACKED
+                
+                # Debug (can remove later)
                 if frame_idx % 30 == 0:
-                    print(f"🔍 Frame {frame_idx}: project.status={project.status}")
-
-                # If tracking results exist, use them (status might be TRACKED or MARKED if tracking just finished)
-                has_tracking_results = len(tracker_manager.tracking_results) > 0
+                    print(f"━━━ FRAME {frame_idx} ━━━")
+                    print(f"  project.status={project.status}, has_tracking_results={has_tracking_results}")
+                
                 if has_tracking_results:
                     # Update current_bbox from stored tracking results
                     # CRITICAL: Always update current_bbox - set to None if no tracking data for this frame
@@ -2614,18 +3197,83 @@ class MainWindow(QMainWindow):
                             if frame_idx % 10 == 0:
                                 print(f"⚠️ Frame {frame_idx}: No padding_offset! hasattr={hasattr(player, 'padding_offset')}, value={getattr(player, 'padding_offset', None)}")
                 else:
-                    # Tracking not started yet - show markers only on frames where players were marked
+                    # Tracking not started yet - DO LIVE TRACKING PREVIEW!
+                    # This allows user to verify tracking works before running full tracking
                     for player in players:
                         # Check if this frame is a learning frame for this player
                         if frame_idx in player.learning_frames:
                             # Use the bbox from learning frame
                             player.current_bbox = player.learning_frames[frame_idx]
+                            player.current_original_bbox = player.original_learning_frames.get(frame_idx, player.current_bbox)
+                            # Reset tracker from learning frame
+                            if player.tracker:
+                                player.tracker.init_tracker(frame, player.current_bbox)
+                            # Store in preview cache
+                            if player.player_id not in self._preview_tracking_cache:
+                                self._preview_tracking_cache[player.player_id] = {}
+                            self._preview_tracking_cache[player.player_id][frame_idx] = player.current_bbox
                         elif frame_idx == player.initial_frame:
                             # Use the initial bbox
                             player.current_bbox = player.bbox
+                            player.current_original_bbox = player.original_bbox
+                            # Initialize tracker
+                            if player.tracker:
+                                print(f"🟢 INIT TRACKER: frame {frame_idx} (initial), bbox={player.bbox}")
+                                success = player.tracker.init_tracker(frame, player.bbox)
+                                print(f"   init_tracker returned: {success}, is_initialized={player.tracker.is_initialized}")
+                            # Store in preview cache
+                            if player.player_id not in self._preview_tracking_cache:
+                                self._preview_tracking_cache[player.player_id] = {}
+                            self._preview_tracking_cache[player.player_id][frame_idx] = player.bbox
                         else:
-                            # No marker for this frame yet (before tracking starts)
-                            player.current_bbox = None
+                            # LIVE TRACKING PREVIEW: Try to track from previous frame
+                            preview_bbox = None
+                            
+                            # Check if we have cached preview for this frame
+                            if player.player_id in self._preview_tracking_cache:
+                                preview_bbox = self._preview_tracking_cache[player.player_id].get(frame_idx)
+                                if preview_bbox:
+                                    print(f"📦 Cache HIT: frame {frame_idx}, bbox={preview_bbox}")
+                            
+                            # If no cache and moving forward, do live tracking
+                            if preview_bbox is None:
+                                has_tracker = player.tracker is not None
+                                is_init = player.tracker.is_initialized if has_tracker else False
+                                prev_frame = self._prev_frame_idx
+                                prev_cached = self._preview_tracking_cache.get(player.player_id, {}).get(prev_frame)
+                                in_learning = prev_frame in player.learning_frames
+                                is_initial = prev_frame == player.initial_frame
+                                
+                                print(f"🔍 LIVE DEBUG: frame={frame_idx}, prev={prev_frame}, has_tracker={has_tracker}, is_init={is_init}")
+                                print(f"   prev_cached={prev_cached is not None}, in_learning={in_learning}, is_initial={is_initial}")
+                                
+                                if has_tracker and is_init:
+                                    if prev_cached is not None or in_learning or is_initial:
+                                        # Track forward
+                                        print(f"   🎯 Calling tracker.update()...")
+                                        tracked_bbox = player.tracker.update(frame)
+                                        print(f"   📍 tracker.update() returned: {tracked_bbox}")
+                                        if tracked_bbox:
+                                            preview_bbox = tracked_bbox
+                                            # Cache the result
+                                            if player.player_id not in self._preview_tracking_cache:
+                                                self._preview_tracking_cache[player.player_id] = {}
+                                            self._preview_tracking_cache[player.player_id][frame_idx] = preview_bbox
+                                            print(f"🔴 LIVE TRACKING: player {player.player_id}, frame {frame_idx}, bbox={preview_bbox}")
+                                        else:
+                                            print(f"   ❌ Tracking returned None/False!")
+                                    else:
+                                        print(f"   ⚠️ Previous frame has no data!")
+                                else:
+                                    print(f"   ⚠️ Tracker not ready!")
+                            
+                            player.current_bbox = preview_bbox
+                            if preview_bbox and hasattr(player, 'padding_offset') and player.padding_offset != (0, 0, 0, 0):
+                                px, py, pw, ph = player.padding_offset
+                                player.current_original_bbox = (preview_bbox[0] + px, preview_bbox[1] + py, 
+                                                                preview_bbox[2] - pw, preview_bbox[3] - ph)
+                            else:
+                                player.current_original_bbox = preview_bbox
                 
                 # Draw markers (will skip if current_bbox is None)
                 # For pre-tracking: show markers on all frames where players were marked
@@ -2640,11 +3288,85 @@ class MainWindow(QMainWindow):
                     tracking_start_frame=tracking_start if has_tracking_results else None,  # Only enforce range if tracking done
                     tracking_end_frame=tracking_end if has_tracking_results else None
                 )
+                
+                # Draw highlight box for selected player (for tracking QA)
+                if hasattr(self, '_selected_player_id') and self._selected_player_id is not None:
+                    selected_player = tracker_manager.get_player(self._selected_player_id)
+                    highlight_bbox = None
+                    if selected_player:
+                        # Get tracked bbox for this frame directly from tracking_results
+                        # This ensures we show the actual tracked position, not the initial position
+                        if has_tracking_results:
+                            # Get the tracked bbox directly from results
+                            tracked_bbox = tracker_manager.get_bbox_at_frame(
+                                self._selected_player_id, frame_idx
+                            )
+                            if tracked_bbox:
+                                highlight_bbox = tracked_bbox
+                                # Debug every 30 frames
+                                if frame_idx % 30 == 0:
+                                    print(f"🎯 Highlight: frame {frame_idx}, tracked_bbox={tracked_bbox}")
+                        
+                        # Fallback for frames without tracking data (before tracking or outside range)
+                        if highlight_bbox is None:
+                            # Check live preview cache first
+                            if self._selected_player_id in self._preview_tracking_cache:
+                                cached = self._preview_tracking_cache[self._selected_player_id].get(frame_idx)
+                                if cached:
+                                    highlight_bbox = cached
+                            
+                            if highlight_bbox is None and selected_player.current_bbox:
+                                highlight_bbox = selected_player.current_bbox
+                            elif highlight_bbox is None and frame_idx in selected_player.learning_frames:
+                                highlight_bbox = selected_player.learning_frames[frame_idx]
+                            elif highlight_bbox is None and frame_idx == selected_player.initial_frame:
+                                highlight_bbox = selected_player.bbox
+                    
+                    if highlight_bbox:
+                        x, y, w, h = highlight_bbox
+                        # Draw bright cyan dashed rectangle to highlight selected player
+                        highlight_color = (255, 255, 0)  # Cyan (BGR)
+                        thickness = 2
+                        # Draw solid rectangle
+                        cv2.rectangle(frame_with_overlay, (x, y), (x + w, y + h), highlight_color, thickness)
+                        # Draw corner markers for emphasis
+                        corner_len = min(20, w // 4, h // 4)
+                        # Top-left
+                        cv2.line(frame_with_overlay, (x, y), (x + corner_len, y), highlight_color, 3)
+                        cv2.line(frame_with_overlay, (x, y), (x, y + corner_len), highlight_color, 3)
+                        # Top-right
+                        cv2.line(frame_with_overlay, (x + w, y), (x + w - corner_len, y), highlight_color, 3)
+                        cv2.line(frame_with_overlay, (x + w, y), (x + w, y + corner_len), highlight_color, 3)
+                        # Bottom-left
+                        cv2.line(frame_with_overlay, (x, y + h), (x + corner_len, y + h), highlight_color, 3)
+                        cv2.line(frame_with_overlay, (x, y + h), (x, y + h - corner_len), highlight_color, 3)
+                        # Bottom-right
+                        cv2.line(frame_with_overlay, (x + w, y + h), (x + w - corner_len, y + h), highlight_color, 3)
+                        cv2.line(frame_with_overlay, (x + w, y + h), (x + w, y + h - corner_len), highlight_color, 3)
+                        
+                        # Add player name label
+                        label = f"{selected_player.name}"
+                        font_scale = 0.6
+                        font_thickness = 2
+                        (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+                        # Background for text
+                        cv2.rectangle(frame_with_overlay, (x, y - text_h - 8), (x + text_w + 8, y), (0, 0, 0), -1)
+                        cv2.putText(frame_with_overlay, label, (x + 4, y - 4), cv2.FONT_HERSHEY_SIMPLEX, 
+                                   font_scale, highlight_color, font_thickness, cv2.LINE_AA)
+                
                 self.video_canvas.set_frame(frame_with_overlay)
+
+                # Update radar bbox if in radar edit mode
+                if self.video_canvas.radar_edit_mode and hasattr(self, '_radar_setting_player_id'):
+                    player = tracker_manager.get_player(self._radar_setting_player_id)
+                    if player and player.current_original_bbox:
+                        self.video_canvas.update_radar_bbox(player.current_original_bbox)
+                    elif player and player.current_bbox:
+                        self.video_canvas.update_radar_bbox(player.current_bbox)
             else:
                 # Just show frame without overlays
                 self.video_canvas.set_frame(frame)
-            
+
             self._update_frame_info()
         except Exception as e:
             print(f"❌ Error showing frame {frame_idx}: {e}")
@@ -2993,43 +3715,40 @@ class MainWindow(QMainWindow):
             if p.player_id == player_id:
                 player = p
                 break
-        
+
         if not player:
             QMessageBox.warning(self, "Error", "Player not found.")
             return
-        
-        # IMPORTANT: Only delete tracking results from AFTER this frame (not including this frame)
-        # This preserves all tracking data up to and including the fix point
-        if player_id in project.tracker_manager.tracking_results:
-            frames_to_delete = [
-                f for f in project.tracker_manager.tracking_results[player_id].keys()
-                if f > frame_idx  # Note: > not >=, so we keep the fix frame
-            ]
-            print(f"🔧 Fix Tracking: Deleting {len(frames_to_delete)} frames after frame {frame_idx}")
-            for f in frames_to_delete:
-                del project.tracker_manager.tracking_results[player_id][f]
-        
-        # CRITICAL: Update player's initial_frame to the fix point
-        # This ensures the tracker will initialize at the correct frame
-        old_initial_frame = player.initial_frame
-        player.initial_frame = frame_idx
-        print(f"🔧 Fix Tracking: Updated player {player_id} initial_frame from {old_initial_frame} to {frame_idx}")
-        
-        # Update player's bbox to the new fix bbox
+
+        # CRITICAL: DO NOT change initial_frame - preserve it to keep tracking context
+        original_initial_frame = player.initial_frame
+        print(f"🔧 Fix Tracking: Preserving initial_frame at {original_initial_frame}")
+
+        # Add correction as a NEW learning frame (this preserves all previous learning frames)
+        # preserve_frame=True means we keep the correction frame's data, only delete after it
+        project.tracker_manager.add_learning_frame_to_player(
+            player_id, frame_idx, (x, y, w, h), (x, y, w, h), preserve_frame=True
+        )
+        print(f"🔧 Fix Tracking: Added learning frame at {frame_idx}")
+        print(f"   Total learning frames: {len(player.learning_frames)}")
+        print(f"   Learning frames: {sorted(player.learning_frames.keys())}")
+
+        # Ensure initial_frame wasn't changed (unless correction is earlier than original)
+        if frame_idx >= original_initial_frame:
+            player.initial_frame = original_initial_frame
+
+        # Update current bbox
         player.bbox = (x, y, w, h)
         player.current_bbox = (x, y, w, h)
-        print(f"🔧 Fix Tracking: Updated player {player_id} bbox to {player.bbox}")
-        
-        # Save the new bbox at this frame (overwrite if exists)
+
+        # Save bbox at this frame
         if player_id not in project.tracker_manager.tracking_results:
             project.tracker_manager.tracking_results[player_id] = {}
         project.tracker_manager.tracking_results[player_id][frame_idx] = (x, y, w, h)
-        
-        # Reset tracker - create new one (will be initialized at fix frame)
-        from ..tracking.player_tracker import PlayerTracker, TrackerType
-        player.tracker = PlayerTracker(TrackerType.CSRT)
+
+        # Reset tracker state (NOT create new tracker - keep learning frames context)
+        player.tracker.is_initialized = False
         player.tracking_lost = False
-        player.tracker.is_initialized = False  # Ensure it will be initialized at fix frame
         
         # Determine tracking end frame (use project's trim_end_frame if set)
         total_frames = project.tracker_manager.total_frames

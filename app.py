@@ -5,6 +5,7 @@ Desktop application for tracking players in videos and adding visual markers
 import sys
 import os
 from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import Qt
 from src.ui.main_window import MainWindow
 
 
@@ -37,7 +38,10 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Video Markme")
     app.setOrganizationName("Video Markme")
-    
+
+    # Force LTR layout for the entire application (fixes slider direction issues)
+    app.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+
     # Create and show main window
     window = MainWindow()
     window.show()
