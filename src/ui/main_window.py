@@ -2415,6 +2415,27 @@ class MainWindow(QMainWindow):
             # Get current frame for preview
             current_frame = project.tracker_manager.get_frame(self.current_frame_idx)
             
+            # If this is a manual drawing (is_ball=False by default), ask user if it's a player or ball
+            # We detect manual drawing when original_bbox is None (not from automatic detection)
+            if original_bbox is None and not is_ball:
+                from PyQt6.QtWidgets import QInputDialog
+                object_types = ["🏃 שחקן (Player)", "⚽ כדור (Ball)"]
+                object_type, ok = QInputDialog.getItem(
+                    self,
+                    "בחר סוג אובייקט",
+                    "מה סימנת?",
+                    object_types,
+                    0,  # Default to player
+                    False
+                )
+                if not ok:
+                    self._waiting_for_bbox = False
+                    self.status_label.setText("Ready")
+                    self.status_label.setStyleSheet("")
+                    return
+                
+                is_ball = "כדור" in object_type
+            
             # Show selector dialog with live preview
             # Use ORIGINAL bbox (if available) for preview so marker appears at correct feet position
             preview_bbox = original_bbox if original_bbox else (x, y, w, h)
@@ -3014,8 +3035,27 @@ class MainWindow(QMainWindow):
             
             # Show selector dialog (in fullscreen window context) with preview
             from .player_selector import PlayerSelector
+            from PyQt6.QtWidgets import QInputDialog
+            
+            # Ask user if it's a player or ball (manual drawing)
+            object_types = ["🏃 שחקן (Player)", "⚽ כדור (Ball)"]
+            object_type, ok = QInputDialog.getItem(
+                fullscreen_window,
+                "בחר סוג אובייקט",
+                "מה סימנת?",
+                object_types,
+                0,  # Default to player
+                False
+            )
+            if not ok:
+                fullscreen_waiting_for_bbox[0] = False
+                button_bar.setVisible(False)
+                return
+            
+            is_ball = "כדור" in object_type
+            
             current_frame = project.tracker_manager.get_frame(self.current_frame_idx)
-            selector = PlayerSelector(fullscreen_window, frame=current_frame, bbox=(x, y, w, h))
+            selector = PlayerSelector(fullscreen_window, frame=current_frame, bbox=(x, y, w, h), is_ball=is_ball)
             
             def on_confirmed(name: str, style: str):
                 # Add player to project (manual bbox selection, no padding)
@@ -3023,13 +3063,16 @@ class MainWindow(QMainWindow):
                     name, style, self.current_frame_idx, (x, y, w, h), None
                 )
                 
-                # Get color for style
+                # Get color for style (includes ball markers)
                 color_map = {
                     'dynamic_ring_3d': (255, 0, 180),  # Purple
                     'spotlight_alien': (200, 255, 255),  # Cyan
                     'solid_anchor': (0, 255, 100),  # Green
                     'radar_defensive': (0, 50, 255),  # Red-Orange
                     'sniper_scope': (0, 0, 255),  # Red
+                    'ball_marker': (0, 165, 255),  # Orange
+                    'fireball_trail': (0, 100, 255),  # Orange-Red
+                    'energy_rings': (255, 200, 0),  # Cyan
                 }
                 color = color_map.get(style, (255, 255, 255))
                 
