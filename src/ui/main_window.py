@@ -17,7 +17,7 @@ import os
 from ..tracking.tracker_manager import TrackerManager
 from ..tracking.project_manager import ProjectManager
 from ..tracking.video_project import VideoProject, ProjectStatus
-from ..tracking.person_detector import PersonDetector
+from ..tracking.person_detector import PersonDetector, ModelSize
 from ..render.video_exporter import VideoExporter
 from ..render.batch_exporter import BatchExportThread
 from .video_canvas import VideoCanvas
@@ -2066,9 +2066,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please select a video first.")
             return
         
-        # Check if person detector is available
+        # Check if person detector is available - use MEDIUM model for better ball detection
         if not hasattr(self, 'person_detector'):
-            self.person_detector = PersonDetector()
+            self.person_detector = PersonDetector(model_size=ModelSize.MEDIUM)
         
         if not self.person_detector.is_available():
             reply = QMessageBox.question(
@@ -2105,11 +2105,17 @@ class MainWindow(QMainWindow):
         
         # Ask user what to detect
         from PyQt6.QtWidgets import QInputDialog
-        detection_types = ["🏃 שחקנים (Players)", "⚽ כדור (Ball)", "🔍 שניהם (Both)"]
+        detection_types = [
+            "🏃 שחקנים (Players)", 
+            "⚽ כדור - רגיל (Ball)", 
+            "🎯 כדור - חיפוש אגרסיבי (Ball Aggressive)",
+            "🔍 שניהם (Both)"
+        ]
         detection_type, ok = QInputDialog.getItem(
             self,
             "בחר סוג זיהוי",
-            "מה תרצה לזהות?",
+            f"מה תרצה לזהות?\n\nמודל נוכחי: {self.person_detector.get_model_info()}\n\n"
+            "💡 טיפ: 'חיפוש אגרסיבי' עובד טוב יותר לכדורים קטנים",
             detection_types,
             0,  # Default to players
             False
@@ -2125,7 +2131,11 @@ class MainWindow(QMainWindow):
             return
         
         # Show progress
-        self.status_label.setText("🔍 מזהה...")
+        aggressive_mode = "אגרסיבי" in detection_type
+        if aggressive_mode:
+            self.status_label.setText("🔍 מזהה כדור (חיפוש אגרסיבי - עשוי לקחת זמן)...")
+        else:
+            self.status_label.setText("🔍 מזהה...")
         self.status_label.setStyleSheet("color: blue;")
         QApplication.processEvents()
         
@@ -2140,7 +2150,12 @@ class MainWindow(QMainWindow):
                 self._detected_balls.append(False)
         
         if "כדור" in detection_type or "שניהם" in detection_type:
-            balls = self.person_detector.detect_balls(current_frame, confidence_threshold=0.15)
+            if aggressive_mode:
+                # Use aggressive multi-technique detection
+                balls = self.person_detector.detect_balls_aggressive(current_frame)
+            else:
+                # Normal detection with low threshold
+                balls = self.person_detector.detect_balls(current_frame, confidence_threshold=0.08)
             for det in balls:
                 all_detections.append(det)
                 self._detected_balls.append(True)
@@ -2243,9 +2258,9 @@ class MainWindow(QMainWindow):
         
         x_offset, y_offset, region_w, region_h = original_region
         
-        # Initialize detector if needed
+        # Initialize detector if needed - use MEDIUM model for better ball detection
         if not hasattr(self, 'person_detector'):
-            self.person_detector = PersonDetector()
+            self.person_detector = PersonDetector(model_size=ModelSize.MEDIUM)
         
         if not self.person_detector.is_available():
             return
