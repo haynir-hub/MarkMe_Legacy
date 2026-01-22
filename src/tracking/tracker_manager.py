@@ -83,6 +83,9 @@ class PlayerData:
             'solid_anchor': (0, 255, 100),  # Green
             'radar_defensive': (0, 50, 255),  # Red-Orange
             'sniper_scope': (0, 0, 255),  # Red
+            'ball_marker': (0, 165, 255),  # Orange
+            'fireball_trail': (0, 100, 255),  # Orange-Red
+            'energy_rings': (255, 200, 0),  # Cyan
         }
         return color_map.get(self.marker_style, (255, 255, 255))
 

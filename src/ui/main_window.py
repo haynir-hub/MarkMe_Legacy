@@ -1069,6 +1069,7 @@ class MainWindow(QMainWindow):
         
         frame_idx = max(0, min(frame_idx, total - 1))
         if frame_idx != self.current_frame_idx:
+            self._prev_frame_idx = self.current_frame_idx  # Store for live tracking
             self.current_frame_idx = frame_idx
             self._show_frame(frame_idx)
     
@@ -1084,6 +1085,7 @@ class MainWindow(QMainWindow):
         
         last_frame = total - 1
         if last_frame != self.current_frame_idx:
+            self._prev_frame_idx = self.current_frame_idx  # Store for live tracking
             self.current_frame_idx = last_frame
             self._show_frame(last_frame)
     
@@ -2058,7 +2060,7 @@ class MainWindow(QMainWindow):
             return "Ctrl+Scroll"
     
     def _add_player_marker(self):
-        """Add a new player marker using automatic person detection"""
+        """Add a new player/ball marker using automatic detection"""
         project = self.project_manager.get_current_project()
         if not project:
             QMessageBox.warning(self, "Warning", "Please select a video first.")
@@ -2072,7 +2074,7 @@ class MainWindow(QMainWindow):
             reply = QMessageBox.question(
                 self,
                 "Detection Not Available",
-                "Automatic person detection is not available.\n\n"
+                "Automatic detection is not available.\n\n"
                 "This might be due to:\n"
                 "- PyTorch DLL loading issue (common on Windows)\n"
                 "- Missing dependencies\n\n"
@@ -2085,7 +2087,7 @@ class MainWindow(QMainWindow):
             
             if reply == QMessageBox.StandardButton.Yes:
                 # Fallback to manual drawing
-                self.status_label.setText("✏️ Draw bounding box on player")
+                self.status_label.setText("✏️ Draw bounding box on player/ball")
                 self.status_label.setStyleSheet("color: orange;")
                 self._waiting_for_bbox = True
                 return
@@ -2101,6 +2103,21 @@ class MainWindow(QMainWindow):
                 )
                 return
         
+        # Ask user what to detect
+        from PyQt6.QtWidgets import QInputDialog
+        detection_types = ["🏃 שחקנים (Players)", "⚽ כדור (Ball)", "🔍 שניהם (Both)"]
+        detection_type, ok = QInputDialog.getItem(
+            self,
+            "בחר סוג זיהוי",
+            "מה תרצה לזהות?",
+            detection_types,
+            0,  # Default to players
+            False
+        )
+        
+        if not ok:
+            return
+        
         # Get current frame
         current_frame = project.tracker_manager.get_frame(self.current_frame_idx)
         if current_frame is None:
@@ -2108,46 +2125,83 @@ class MainWindow(QMainWindow):
             return
         
         # Show progress
-        self.status_label.setText("🔍 Detecting people in frame...")
+        self.status_label.setText("🔍 מזהה...")
         self.status_label.setStyleSheet("color: blue;")
         QApplication.processEvents()
         
-        # Detect people in current frame
-        detections = self.person_detector.detect_people(current_frame, confidence_threshold=0.25)
+        # Detect based on selection
+        all_detections = []
+        self._detected_balls = []  # Track which detections are balls
         
-        if not detections:
-            self.status_label.setText("No people detected. Try another frame or draw manually.")
+        if "שחקנים" in detection_type or "שניהם" in detection_type:
+            people = self.person_detector.detect_people(current_frame, confidence_threshold=0.25)
+            for det in people:
+                all_detections.append(det)
+                self._detected_balls.append(False)
+        
+        if "כדור" in detection_type or "שניהם" in detection_type:
+            balls = self.person_detector.detect_balls(current_frame, confidence_threshold=0.15)
+            for det in balls:
+                all_detections.append(det)
+                self._detected_balls.append(True)
+        
+        if not all_detections:
+            self.status_label.setText("לא זוהה כלום. נסה פריים אחר או צייר ידנית.")
             self.status_label.setStyleSheet("color: orange;")
             try:
-                self.statusBar().showMessage("No people detected in this frame. Try a different frame or draw manually.", 4000)
+                self.statusBar().showMessage("לא נמצאו זיהויים בפריים הזה. נסה פריים אחר או צייר ידנית.", 4000)
             except Exception:
                 pass
             return
         
-        # Show detected people on canvas
-        self.video_canvas.set_detected_people(detections)
+        # Show detected items on canvas
+        self.video_canvas.set_detected_people(all_detections)
         self.video_canvas.enable_detection_mode(True)
         
         # Update status
-        num_detected = len(detections)
-        self.status_label.setText(f"✅ Found {num_detected} person(s). Click on a person to select them.")
+        num_people = sum(1 for is_ball in self._detected_balls if not is_ball)
+        num_balls = sum(1 for is_ball in self._detected_balls if is_ball)
+        status_parts = []
+        if num_people > 0:
+            status_parts.append(f"{num_people} שחקן(ים)")
+        if num_balls > 0:
+            status_parts.append(f"{num_balls} כדור(ים)")
+        
+        self.status_label.setText(f"✅ נמצאו: {', '.join(status_parts)}. לחץ לבחירה.")
         self.status_label.setStyleSheet("color: green;")
         try:
-            self.statusBar().showMessage(f"🔍 System detected {num_detected} players. Click a player or draw a box.", 4000)
+            self.statusBar().showMessage(f"🔍 זוהו {len(all_detections)} אובייקטים. לחץ לבחירה או צייר ידנית.", 4000)
         except Exception:
             pass
         self._waiting_for_bbox = True
     
     def _on_person_clicked(self, x: int, y: int, w: int, h: int):
-        """Handle clicking on a detected person"""
+        """Handle clicking on a detected person or ball"""
         print(f"_on_person_clicked called: bbox=({x}, {y}, {w}, {h})")
+        
+        # Check if this detection is a ball
+        is_ball = False
+        if hasattr(self, '_detected_balls') and self._detected_balls:
+            # Find which detection was clicked by matching bbox
+            detected_people = self.video_canvas._detected_people if hasattr(self.video_canvas, '_detected_people') else []
+            for i, det in enumerate(detected_people):
+                det_x, det_y, det_w, det_h, _ = det
+                if det_x == x and det_y == y and det_w == w and det_h == h:
+                    if i < len(self._detected_balls):
+                        is_ball = self._detected_balls[i]
+                    break
         
         # Disable detection mode
         self.video_canvas.enable_detection_mode(False)
         
         # Add padding to bbox for better tracking (symmetric)
-        padding_x = max(int(w * 0.2), 10)
-        padding_y = max(int(h * 0.2), 10)
+        # Use smaller padding for balls since they're already small
+        if is_ball:
+            padding_x = max(int(w * 0.3), 5)
+            padding_y = max(int(h * 0.3), 5)
+        else:
+            padding_x = max(int(w * 0.2), 10)
+            padding_y = max(int(h * 0.2), 10)
 
         # Adjust bbox with padding
         x_padded = max(0, x - padding_x)
@@ -2163,10 +2217,10 @@ class MainWindow(QMainWindow):
             w_padded = min(w_padded, frame_w - x_padded)
             h_padded = min(h_padded, frame_h - y_padded)
         
-        print(f"Added padding: original=({x}, {y}, {w}, {h}), padded=({x_padded}, {y_padded}, {w_padded}, {h_padded})")
+        print(f"Added padding: original=({x}, {y}, {w}, {h}), padded=({x_padded}, {y_padded}, {w_padded}, {h_padded}), is_ball={is_ball}")
 
         # Use the padded bbox for tracking, but pass original bbox for accurate marker placement
-        self._on_bbox_selected(x_padded, y_padded, w_padded, h_padded, original_bbox=(x, y, w, h))
+        self._on_bbox_selected(x_padded, y_padded, w_padded, h_padded, original_bbox=(x, y, w, h), is_ball=is_ball)
     
     def _on_zoom_changed(self, zoom_level: float, visible_region: tuple):
         """Handle zoom level changes"""
@@ -2224,9 +2278,10 @@ class MainWindow(QMainWindow):
             pass
     
     def _on_bbox_selected(self, x: int, y: int, w: int, h: int,
-                         original_bbox: Optional[Tuple[int, int, int, int]] = None):
+                         original_bbox: Optional[Tuple[int, int, int, int]] = None,
+                         is_ball: bool = False):
         """Handle bounding box selection (manual or from detection)"""
-        print(f"_on_bbox_selected called: bbox=({x}, {y}, {w}, {h}), original_bbox={original_bbox}")
+        print(f"_on_bbox_selected called: bbox=({x}, {y}, {w}, {h}), original_bbox={original_bbox}, is_ball={is_ball}")
         try:
             # Disable detection mode if active
             self.video_canvas.enable_detection_mode(False)
@@ -2316,6 +2371,9 @@ class MainWindow(QMainWindow):
                         'solid_anchor': (0, 255, 100),  # Green
                         'radar_defensive': (0, 50, 255),  # Red-Orange
                         'sniper_scope': (0, 0, 255),  # Red
+                        'ball_marker': (0, 165, 255),  # Orange
+                        'fireball_trail': (0, 100, 255),  # Orange-Red
+                        'energy_rings': (255, 200, 0),  # Cyan
                     }
                     color = color_map.get(selected_player.marker_style, (255, 255, 255))
                     self.video_canvas.add_bbox(x, y, w, h, f"{selected_player.name} (Learning)", selected_player.marker_style, color)
@@ -2345,7 +2403,7 @@ class MainWindow(QMainWindow):
             # Show selector dialog with live preview
             # Use ORIGINAL bbox (if available) for preview so marker appears at correct feet position
             preview_bbox = original_bbox if original_bbox else (x, y, w, h)
-            selector = PlayerSelector(self, frame=current_frame, bbox=preview_bbox)
+            selector = PlayerSelector(self, frame=current_frame, bbox=preview_bbox, is_ball=is_ball)
             
             def on_confirmed(name: str, style: str):
                 try:
@@ -2354,13 +2412,16 @@ class MainWindow(QMainWindow):
                         name, style, self.current_frame_idx, (x, y, w, h), original_bbox
                     )
                     
-                    # Get color for style
+                    # Get color for style (includes ball markers)
                     color_map = {
                         'dynamic_ring_3d': (255, 0, 180),  # Purple
                         'spotlight_alien': (200, 255, 255),  # Cyan
                         'solid_anchor': (0, 255, 100),  # Green
                         'radar_defensive': (0, 50, 255),  # Red-Orange
                         'sniper_scope': (0, 0, 255),  # Red
+                        'ball_marker': (0, 165, 255),  # Orange
+                        'fireball_trail': (0, 100, 255),  # Orange-Red
+                        'energy_rings': (255, 200, 0),  # Cyan
                     }
                     color = color_map.get(style, (255, 255, 255))
                     
@@ -3412,6 +3473,7 @@ class MainWindow(QMainWindow):
     def _on_slider_changed(self, value: int):
         """Handle slider value change - jump to frame"""
         if value != self.current_frame_idx:
+            self._prev_frame_idx = self.current_frame_idx  # Store for live tracking
             self.current_frame_idx = value
             self._show_frame(value)
     
@@ -3419,6 +3481,7 @@ class MainWindow(QMainWindow):
         """Handle frame number spinbox change - jump to frame (1-based)"""
         frame_idx = value - 1  # Convert to 0-based
         if frame_idx != self.current_frame_idx:
+            self._prev_frame_idx = self.current_frame_idx  # Store for live tracking
             self.current_frame_idx = frame_idx
             self._show_frame(frame_idx)
     
@@ -3436,6 +3499,7 @@ class MainWindow(QMainWindow):
         new_idx = max(0, min(new_idx, total - 1))
         
         if new_idx != self.current_frame_idx:
+            self._prev_frame_idx = self.current_frame_idx  # Store for live tracking
             self.current_frame_idx = new_idx
             self._show_frame(new_idx)
     

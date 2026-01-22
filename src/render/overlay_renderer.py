@@ -99,6 +99,18 @@ class OverlayRenderer:
             return self.modern_styles.draw_sniper_scope(
                 frame, bbox, (0, 0, 255), player, self.frame_count)
 
+        elif marker_style == 'ball_marker':
+            return self.modern_styles.draw_ball_marker(
+                frame, bbox, (0, 165, 255), player, self.frame_count)
+
+        elif marker_style == 'fireball_trail':
+            return self.modern_styles.draw_fireball_trail(
+                frame, bbox, (0, 100, 255), player, self.frame_count)
+
+        elif marker_style == 'energy_rings':
+            return self.modern_styles.draw_energy_rings(
+                frame, bbox, (255, 200, 0), player, self.frame_count)
+
         else:
             return self._draw_rectangle(frame, bbox, color)
 

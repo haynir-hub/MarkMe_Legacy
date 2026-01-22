@@ -25,21 +25,29 @@ class PlayerSelector(QDialog):
         ("🟢 Solid Floor Anchor (Green Ellipse)", "solid_anchor"),
         ("🔺 Defensive Radar (Coverage Cone)", "radar_defensive"),
         ("🎯 Sniper Scope (Crosshair Reticle)", "sniper_scope"),
+        ("⚽ Ball Marker (Glowing)", "ball_marker"),
+        ("🔥 Fireball Trail (Comet)", "fireball_trail"),
+        ("⚡ Energy Rings (Atom)", "energy_rings"),
     ]
-    
+
     DESCRIPTIONS = {
         "dynamic_ring_3d": "טבעת סגולה תלת-ממדית על הרצפה עם אפקט פעימה",
         "spotlight_alien": "קרן אור צרה מהתקרה - מחשיך סביב השחקן",
         "solid_anchor": "אליפסה ירוקה מלאה על הרצפה מתחת לשחקן",
         "radar_defensive": "חרוט המראה את אזור הכיסוי ההגנתי של השחקן",
         "sniper_scope": "כוונת צלף - קרוסהייר גדול סביב השחקן",
+        "ball_marker": "סימון כדור - עיגול זוהר כתום לסימון מיקום הכדור",
+        "fireball_trail": "כדור אש - שובל להבה דרמטי שמראה כיוון תנועה",
+        "energy_rings": "טבעות אנרגיה - טבעות מסתובבות סביב הכדור כמו אטום",
     }
     
     def __init__(self, parent=None, frame: np.ndarray = None, 
                  bbox: Tuple[int, int, int, int] = None,
-                 existing_name: str = "", existing_style: str = None):
+                 existing_name: str = "", existing_style: str = None,
+                 is_ball: bool = False):
         super().__init__(parent)
-        self.setWindowTitle("בחר סגנון מרקר")
+        self.is_ball = is_ball
+        self.setWindowTitle("בחר סגנון מרקר לכדור" if is_ball else "בחר סגנון מרקר")
         self.setMinimumWidth(700)
         self.setMinimumHeight(500)
         
@@ -47,6 +55,10 @@ class PlayerSelector(QDialog):
         self.frame = frame
         self.bbox = bbox
         self.renderer = None
+        
+        # If is_ball and no existing_style, default to ball_marker
+        if is_ball and not existing_style:
+            existing_style = "ball_marker"
         
         # Lazy load renderer
         if frame is not None and bbox is not None:
@@ -56,12 +68,12 @@ class PlayerSelector(QDialog):
             except ImportError:
                 pass
         
-        self._setup_ui(existing_name, existing_style)
+        self._setup_ui(existing_name, existing_style, is_ball)
         
         # Initial preview
         self._update_preview()
     
-    def _setup_ui(self, existing_name: str, existing_style: str):
+    def _setup_ui(self, existing_name: str, existing_style: str, is_ball: bool = False):
         """Setup UI with preview panel"""
         main_layout = QHBoxLayout()
         
@@ -90,12 +102,15 @@ class PlayerSelector(QDialog):
         # ===== RIGHT: Controls Panel =====
         controls_panel = QVBoxLayout()
         
-        # Player name
-        name_group = QGroupBox("שם השחקן (אופציונלי)")
+        # Player/Ball name
+        name_group = QGroupBox("שם הכדור (אופציונלי)" if is_ball else "שם השחקן (אופציונלי)")
         name_layout = QVBoxLayout()
         self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("הכנס שם שחקן...")
-        self.name_input.setText(existing_name)
+        self.name_input.setPlaceholderText("הכנס שם..." if is_ball else "הכנס שם שחקן...")
+        if is_ball and not existing_name:
+            self.name_input.setText("כדור")  # Default name for ball
+        else:
+            self.name_input.setText(existing_name)
         name_layout.addWidget(self.name_input)
         name_group.setLayout(name_layout)
         controls_panel.addWidget(name_group)
