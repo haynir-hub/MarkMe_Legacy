@@ -29,7 +29,7 @@ class PersonDetector:
     CLASS_PERSON = 0
     CLASS_SPORTS_BALL = 32
     
-    def __init__(self, model_size: ModelSize = ModelSize.MEDIUM, version: int = 8):
+    def __init__(self, model_size: ModelSize = ModelSize.LARGE, version: int = 11):
         """
         Initialize detector with specified model size.
         

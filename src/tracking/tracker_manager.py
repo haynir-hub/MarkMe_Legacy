@@ -429,6 +429,101 @@ class TrackerManager:
     def release(self):
         if self.video_cap: self.video_cap.release(); self.video_cap = None
 
+    def _is_ball_marker(self, marker_style: str) -> bool:
+        """Check if this is a ball marker style"""
+        return marker_style in ('ball_marker', 'fireball_trail', 'energy_rings')
+    
+    def _try_reacquire_ball(self, frame: np.ndarray, last_bbox: Tuple[int, int, int, int], 
+                           search_radius: int = 150) -> Optional[Tuple[int, int, int, int]]:
+        """
+        Try to reacquire a lost ball using YOLO detection.
+        Searches in a region around the last known position.
+        
+        Args:
+            frame: Current video frame
+            last_bbox: Last known bounding box of the ball
+            search_radius: Radius to search around last position
+            
+        Returns:
+            New bounding box if found, None otherwise
+        """
+        if last_bbox is None:
+            return None
+        
+        try:
+            # Calculate search region around last known position
+            lx, ly, lw, lh = last_bbox
+            center_x = lx + lw // 2
+            center_y = ly + lh // 2
+            
+            h, w = frame.shape[:2]
+            
+            # Define search region (expand from last position)
+            x1 = max(0, center_x - search_radius)
+            y1 = max(0, center_y - search_radius)
+            x2 = min(w, center_x + search_radius)
+            y2 = min(h, center_y + search_radius)
+            
+            # Extract search region
+            search_region = frame[y1:y2, x1:x2]
+            
+            if search_region.size == 0:
+                return None
+            
+            # Run ball detection on search region
+            detections = self.person_detector.detect_balls(search_region, confidence_threshold=0.05)
+            
+            if detections:
+                # Find the detection closest to the center (most likely to be our ball)
+                best_det = None
+                best_dist = float('inf')
+                region_center_x = (x2 - x1) // 2
+                region_center_y = (y2 - y1) // 2
+                
+                for det in detections:
+                    dx, dy, dw, dh, conf = det
+                    det_center_x = dx + dw // 2
+                    det_center_y = dy + dh // 2
+                    dist = ((det_center_x - region_center_x) ** 2 + (det_center_y - region_center_y) ** 2) ** 0.5
+                    
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_det = det
+                
+                if best_det:
+                    dx, dy, dw, dh, conf = best_det
+                    # Convert back to full frame coordinates
+                    return (x1 + dx, y1 + dy, dw, dh)
+            
+            # If not found in search region, try full frame with aggressive detection
+            if hasattr(self.person_detector, 'detect_balls_aggressive'):
+                full_detections = self.person_detector.detect_balls_aggressive(frame)
+                if full_detections:
+                    # Find closest to last known position
+                    best_det = None
+                    best_dist = float('inf')
+                    
+                    for det in full_detections:
+                        dx, dy, dw, dh, conf = det
+                        det_center_x = dx + dw // 2
+                        det_center_y = dy + dh // 2
+                        dist = ((det_center_x - center_x) ** 2 + (det_center_y - center_y) ** 2) ** 0.5
+                        
+                        # Only consider if reasonably close (within 2x search radius)
+                        if dist < search_radius * 2 and dist < best_dist:
+                            best_dist = dist
+                            best_det = det
+                    
+                    if best_det:
+                        dx, dy, dw, dh, conf = best_det
+                        return (dx, dy, dw, dh)
+            
+            return None
+            
+        except Exception as e:
+            print(f"⚠️ Ball reacquisition error: {e}")
+            return None
+
     def generate_tracking_data(self, start_frame=0, end_frame=None, progress_callback=None):
         if self.video_path is None: raise ValueError("No video loaded")
         if end_frame is None: end_frame = self.total_frames - 1
@@ -442,6 +537,10 @@ class TrackerManager:
             for f in list(tracking_data[pid].keys()):
                 if f >= resume_start: del tracking_data[pid][f]
 
+        # Track frames since each player's tracking was lost (for ball reacquisition)
+        frames_lost: Dict[int, int] = {}
+        last_good_bbox: Dict[int, Tuple[int, int, int, int]] = {}
+
         for f_idx in range(resume_start, end_frame + 1):
             ret, frame = cap.read()
             if not ret: break
@@ -449,14 +548,40 @@ class TrackerManager:
             
             for pid, player in self.players.items():
                 is_learning = f_idx in player.learning_frames
+                is_ball = self._is_ball_marker(player.marker_style)
+                
                 if f_idx == resume_start or is_learning:
                     bbox = player.learning_frames.get(f_idx, player.bbox)
                     player.tracker.init_tracker(frame, bbox)
                     success, conf = True, 1.0
+                    frames_lost[pid] = 0
+                    last_good_bbox[pid] = bbox
                 else:
                     bbox = player.tracker.update(frame)
                     success = bbox is not None
                     conf = 0.8 if success else 0.0
+                    
+                    # Ball tracking enhancement: try to reacquire when lost
+                    if not success and is_ball:
+                        frames_lost[pid] = frames_lost.get(pid, 0) + 1
+                        
+                        # Try to reacquire every few frames (not every frame for performance)
+                        if frames_lost[pid] <= 30 and frames_lost[pid] % 3 == 0:
+                            last_bbox = last_good_bbox.get(pid)
+                            if last_bbox:
+                                print(f"🔍 Ball lost for player {pid}, attempting reacquisition (frame {f_idx})...")
+                                reacquired_bbox = self._try_reacquire_ball(frame, last_bbox)
+                                if reacquired_bbox:
+                                    print(f"✅ Ball reacquired at {reacquired_bbox}")
+                                    bbox = reacquired_bbox
+                                    player.tracker.init_tracker(frame, bbox)
+                                    success = True
+                                    conf = 0.6  # Lower confidence for reacquired
+                                    frames_lost[pid] = 0
+                    
+                    if success:
+                        frames_lost[pid] = 0
+                        last_good_bbox[pid] = bbox
                 
                 orig_bbox = None
                 if success:

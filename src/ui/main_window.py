@@ -2066,9 +2066,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please select a video first.")
             return
         
-        # Check if person detector is available - use MEDIUM model for better ball detection
+        # Check if person detector is available - use LARGE model + YOLOv11 for best ball detection
         if not hasattr(self, 'person_detector'):
-            self.person_detector = PersonDetector(model_size=ModelSize.MEDIUM)
+            self.person_detector = PersonDetector(model_size=ModelSize.LARGE)
         
         if not self.person_detector.is_available():
             reply = QMessageBox.question(
@@ -2258,9 +2258,9 @@ class MainWindow(QMainWindow):
         
         x_offset, y_offset, region_w, region_h = original_region
         
-        # Initialize detector if needed - use MEDIUM model for better ball detection
+        # Initialize detector if needed - use LARGE model + YOLOv11 for best ball detection
         if not hasattr(self, 'person_detector'):
-            self.person_detector = PersonDetector(model_size=ModelSize.MEDIUM)
+            self.person_detector = PersonDetector(model_size=ModelSize.LARGE)
         
         if not self.person_detector.is_available():
             return

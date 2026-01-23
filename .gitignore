@@ -42,3 +42,6 @@ Thumbs.db
 
 # Logs
 *.log
+yolov8m.pt
+yolov8l.pt
+yolo11*.pt
