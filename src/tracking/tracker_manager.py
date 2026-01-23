@@ -227,11 +227,23 @@ class PlayerData:
     def is_visible_at_frame(self, frame_idx: int, global_start: int = 0, global_end: int = None) -> bool:
         """
         Check if this player should be visible at the given frame.
-        Uses player-specific range if set, otherwise uses global range.
+        
+        IMPORTANT: A player is NEVER visible before their initial_frame (the frame
+        where they were first marked). This ensures that if you mark a player at
+        frame 200, they won't appear at frame 0.
+        
+        Uses player-specific range if set, otherwise uses global range,
+        but always respects initial_frame as the absolute minimum.
         """
+        # CRITICAL: Never show marker before the frame where player was first defined
+        if frame_idx < self.initial_frame:
+            return False
+        
+        # Check custom player range (if set)
         start = self.player_start_frame if self.player_start_frame is not None else global_start
         end = self.player_end_frame if self.player_end_frame is not None else global_end
         
+        # Apply range constraints (but initial_frame already ensures minimum)
         if start is not None and frame_idx < start:
             return False
         if end is not None and frame_idx > end:
@@ -343,7 +355,7 @@ class TrackerManager:
                                                  tuple(int(v) for v in original_bbox) if original_bbox else None)
         self.invalidate_tracking_from(player_id, frame_idx, include_current=not preserve_frame)
         return True
-
+    
     def invalidate_tracking_from(self, player_id: int, frame_idx: int, include_current: bool = True):
         """Invalidate tracking from a frame. include_current=False keeps that frame."""
         if player_id not in self.needs_recompute_from:
@@ -468,8 +480,8 @@ class TrackerManager:
             search_region = frame[y1:y2, x1:x2]
             
             if search_region.size == 0:
-                return None
-            
+                        return None
+
             # Run ball detection on search region
             detections = self.person_detector.detect_balls(search_region, confidence_threshold=0.05)
             
@@ -517,13 +529,13 @@ class TrackerManager:
                     if best_det:
                         dx, dy, dw, dh, conf = best_det
                         return (dx, dy, dw, dh)
-            
+
             return None
-            
+
         except Exception as e:
             print(f"⚠️ Ball reacquisition error: {e}")
             return None
-
+    
     def generate_tracking_data(self, start_frame=0, end_frame=None, progress_callback=None):
         if self.video_path is None: raise ValueError("No video loaded")
         if end_frame is None: end_frame = self.total_frames - 1
@@ -532,8 +544,26 @@ class TrackerManager:
         cap.set(cv2.CAP_PROP_POS_FRAMES, resume_start)
         
         tracking_data = self.tracking_data
+        
+        # IMPORTANT: For each player, find their last known bbox BEFORE resume_start
+        # This preserves tracking continuity when adding corrections
+        last_bbox_before_resume: Dict[int, Optional[Tuple[int, int, int, int]]] = {}
+        
         for pid in self.players:
             if pid not in tracking_data: tracking_data[pid] = {}
+            
+            # Find the last known bbox before resume_start (to preserve tracking continuity)
+            last_bbox = None
+            if tracking_data[pid]:
+                frames_before = [f for f in tracking_data[pid].keys() if f < resume_start]
+                if frames_before:
+                    last_frame = max(frames_before)
+                    data = tracking_data[pid][last_frame]
+                    if data.get('bbox'):
+                        last_bbox = data['bbox']
+            last_bbox_before_resume[pid] = last_bbox
+            
+            # Only delete tracking data FROM resume_start onwards (preserve earlier data!)
             for f in list(tracking_data[pid].keys()):
                 if f >= resume_start: del tracking_data[pid][f]
 
@@ -547,10 +577,39 @@ class TrackerManager:
             if progress_callback: progress_callback(f_idx - resume_start + 1, end_frame - resume_start + 1)
             
             for pid, player in self.players.items():
+                # Skip frames before player's initial_frame
+                # (player shouldn't be tracked before they were first marked)
+                if f_idx < player.initial_frame:
+                    continue
+                
                 is_learning = f_idx in player.learning_frames
                 is_ball = self._is_ball_marker(player.marker_style)
                 
-                if f_idx == resume_start or is_learning:
+                # Determine what bbox to use for initialization
+                if is_learning:
+                    # User explicitly marked this frame - use their bbox
+                    bbox = player.learning_frames[f_idx]
+                    player.tracker.init_tracker(frame, bbox)
+                    success, conf = True, 1.0
+                    frames_lost[pid] = 0
+                    last_good_bbox[pid] = bbox
+                elif f_idx == resume_start:
+                    # First frame of this tracking run
+                    # Priority: learning frame > last known bbox > initial bbox
+                    if f_idx in player.learning_frames:
+                        bbox = player.learning_frames[f_idx]
+                    elif last_bbox_before_resume.get(pid):
+                        # Use last known bbox to maintain continuity
+                        bbox = last_bbox_before_resume[pid]
+                    else:
+                        # Fall back to initial bbox (only if this IS the initial frame)
+                        bbox = player.bbox
+                    player.tracker.init_tracker(frame, bbox)
+                    success, conf = True, 1.0
+                    frames_lost[pid] = 0
+                    last_good_bbox[pid] = bbox
+                elif f_idx == player.initial_frame:
+                    # This is the very first frame for this player
                     bbox = player.learning_frames.get(f_idx, player.bbox)
                     player.tracker.init_tracker(frame, bbox)
                     success, conf = True, 1.0
@@ -575,7 +634,7 @@ class TrackerManager:
                                     print(f"✅ Ball reacquired at {reacquired_bbox}")
                                     bbox = reacquired_bbox
                                     player.tracker.init_tracker(frame, bbox)
-                                    success = True
+                            success = True
                                     conf = 0.6  # Lower confidence for reacquired
                                     frames_lost[pid] = 0
                     
