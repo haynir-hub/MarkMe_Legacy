@@ -634,7 +634,7 @@ class TrackerManager:
                                     print(f"✅ Ball reacquired at {reacquired_bbox}")
                                     bbox = reacquired_bbox
                                     player.tracker.init_tracker(frame, bbox)
-                            success = True
+                                    success = True
                                     conf = 0.6  # Lower confidence for reacquired
                                     frames_lost[pid] = 0
                     
